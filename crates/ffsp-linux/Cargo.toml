@@ -1,0 +1,23 @@
+[package]
+name = "ffsp-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ffsp-protocol.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+bluer = { version = "0.17.4", features = ["bluetoothd", "id", "rfcomm", "l2cap"] }
+nusb = { version = "0.2.7", features = ["tokio"] }
+mdns-sd = "0.21.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+uuid = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "fileshare-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ffsp-linux = { path = "../ffsp-linux" }
+ffsp-protocol.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+crownuikit = { path = "../../../crownuikit" }
+xilem = "0.4.0"
+winit = "0.30.13"
+blinc_icons = "0.5.1"
+rfd = "0.16.0"
+
+[lints]
+workspace = true
