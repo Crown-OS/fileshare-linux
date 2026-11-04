@@ -1060,6 +1060,7 @@ dependencies = [
  "notify",
  "ron",
  "serde",
+ "thiserror 2.0.20",
  "xilem",
 ]
 

@@ -139,10 +139,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "  {:04x}:{:04x}  accessory={}",
                     device.vendor_id(),
                     device.product_id(),
-                    ffsp_linux::medium::aoa::is_accessory(
-                        device.vendor_id(),
-                        device.product_id()
-                    ),
+                    ffsp_linux::medium::aoa::is_accessory(device.vendor_id(), device.product_id()),
                 );
             }
             match ffsp_linux::medium::UsbMedium::new("probe").open().await {
