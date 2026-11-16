@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use crownui::kit::Theme;
+use crownui::prelude::{Color, Cx, Runtime, Signal};
 use ffsp_protocol::medium::Medium;
 use ffsp_protocol::metrics::TransferReport;
 use ffsp_protocol::transfer::Progress;
 use ffsp_protocol::wire::LaneId;
-use xilem::masonry::peniko::Color;
-use xilem::tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// How many samples the trace remembers: thirty seconds at ten a second.
 pub(crate) const HISTORY: usize = 300;
@@ -42,7 +43,7 @@ pub(crate) enum RigEvent {
 }
 
 /// One medium as the window is currently seeing it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LaneView {
     pub(crate) lane: LaneId,
     pub(crate) medium: Medium,
@@ -71,132 +72,124 @@ impl LaneView {
         self.history.push_back(f64::from(kbps));
     }
 
-    pub(crate) fn samples(&self) -> Vec<f64> {
-        self.history.iter().copied().collect()
+    pub(crate) fn key(&self) -> LaneId {
+        self.lane
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct AppState {
-    pub(crate) page: Page,
-    pub(crate) busy: bool,
-    pub(crate) status: String,
-    pub(crate) readiness: Vec<(Medium, bool)>,
-    pub(crate) lanes: Vec<LaneView>,
-    pub(crate) progress: Option<Progress>,
-    pub(crate) report: Option<TransferReport>,
-    pub(crate) chosen: Option<PathBuf>,
-    control: Option<UnboundedSender<RigCommand>>,
+/// The window's state, as signals every view reads from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Store {
+    pub(crate) page: Signal<Page>,
+    pub(crate) busy: Signal<bool>,
+    pub(crate) status: Signal<String>,
+    pub(crate) readiness: Signal<Vec<(Medium, bool)>>,
+    pub(crate) lanes: Signal<Vec<LaneView>>,
+    pub(crate) progress: Signal<Option<Progress>>,
+    pub(crate) report: Signal<Option<TransferReport>>,
+    pub(crate) chosen: Signal<Option<PathBuf>>,
+    control: Signal<Option<UnboundedSender<RigCommand>>>,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
+impl Store {
+    pub(crate) fn new(cx: &mut Cx) -> Self {
         Self {
-            page: Page::Overview,
-            busy: false,
-            status: "Idle. Bring the phone into range and press Receive.".to_owned(),
-            readiness: Vec::new(),
-            lanes: Vec::new(),
-            progress: None,
-            report: None,
-            chosen: None,
-            control: None,
+            page: cx.signal(Page::Overview),
+            busy: cx.signal(false),
+            status: cx.signal("Idle. Bring the phone into range and press Receive.".to_owned()),
+            readiness: cx.signal(Vec::new()),
+            lanes: cx.signal(Vec::new()),
+            progress: cx.signal(None),
+            report: cx.signal(None),
+            chosen: cx.signal(None),
+            control: cx.signal(None),
         }
     }
-}
 
-impl AppState {
-    pub(crate) fn attach(&mut self, sender: UnboundedSender<RigCommand>) {
-        self.control = Some(sender);
+    pub(crate) fn attach(self, runtime: &mut Runtime, sender: UnboundedSender<RigCommand>) {
+        self.control.set(runtime, Some(sender));
     }
 
     /// Sends a command, or quietly does nothing if the worker has not started yet.
-    pub(crate) fn command(&mut self, command: RigCommand) {
-        if self.busy {
+    pub(crate) fn command(self, runtime: &mut Runtime, command: RigCommand) {
+        if self.busy.with_untracked(runtime, |busy| *busy) {
             return;
         }
-        if let Some(control) = &self.control
-            && control.send(command).is_ok()
-        {
-            self.busy = true;
-            self.lanes.clear();
-            self.progress = None;
-            self.report = None;
+        let sent = self.control.with_untracked(runtime, |control| {
+            control
+                .as_ref()
+                .is_some_and(|control| control.send(command).is_ok())
+        });
+        if sent {
+            self.busy.set(runtime, true);
+            self.lanes.set(runtime, Vec::new());
+            self.progress.set(runtime, None);
+            self.report.set(runtime, None);
         }
     }
 
-    pub(crate) fn apply(&mut self, event: RigEvent) {
+    pub(crate) fn apply(self, runtime: &mut Runtime, event: RigEvent) {
         match event {
-            RigEvent::Status(status) => self.status = status,
-            RigEvent::Readiness(readiness) => self.readiness = readiness,
+            RigEvent::Status(status) => self.status.set(runtime, status),
+            RigEvent::Readiness(readiness) => self.readiness.set(runtime, readiness),
             RigEvent::Lane {
                 lane,
                 medium,
                 kbps,
                 bytes,
-            } => {
-                let view = match self.lanes.iter_mut().find(|view| view.lane == lane) {
-                    Some(view) => view,
+            } => self.lanes.update(runtime, |lanes| {
+                match lanes.iter_mut().find(|view| view.lane == lane) {
+                    Some(view) => view.observe(kbps, bytes),
                     None => {
-                        self.lanes.push(LaneView::new(lane, medium));
-                        match self.lanes.last_mut() {
-                            Some(view) => view,
-                            None => return,
-                        }
+                        let mut view = LaneView::new(lane, medium);
+                        view.observe(kbps, bytes);
+                        lanes.push(view);
                     }
-                };
-                view.observe(kbps, bytes);
-            }
-            RigEvent::Progress(progress) => self.progress = Some(progress),
+                }
+            }),
+            RigEvent::Progress(progress) => self.progress.set(runtime, Some(progress)),
             RigEvent::Finished(report) => {
-                self.status = format!(
+                let status = format!(
                     "Done — {} across {} medium{}",
                     crate::report::kbps(report.aggregate_kbps()),
                     report.lanes.len(),
                     if report.lanes.len() == 1 { "" } else { "s" }
                 );
-                self.report = Some(*report);
-                self.busy = false;
-                self.page = Page::Benchmark;
+                self.status.set(runtime, status);
+                self.report.set(runtime, Some(*report));
+                self.busy.set(runtime, false);
+                self.page.set(runtime, Page::Benchmark);
             }
             RigEvent::Failed(reason) => {
-                self.status = reason;
-                self.busy = false;
+                self.status.set(runtime, reason);
+                self.busy.set(runtime, false);
             }
         }
     }
-
-    /// The scale every trace is drawn against, so two lanes can be compared by eye.
-    pub(crate) fn ceiling(&self) -> f64 {
-        self.lanes
-            .iter()
-            .flat_map(|lane| lane.history.iter().copied())
-            .fold(1.0_f64, f64::max)
-    }
-
-    pub(crate) fn fraction(&self) -> f64 {
-        self.progress
-            .map(|progress| {
-                if progress.total_bytes == 0 {
-                    0.0
-                } else {
-                    progress.delivered_bytes as f64 / progress.total_bytes as f64
-                }
-            })
-            .unwrap_or(0.0)
-    }
 }
 
-/// A stable colour per medium, taken from the palette rather than invented.
-///
-/// The kit's one rule is that no widget names a colour, and a benchmark legend is no exception:
-/// these have to follow the theme like everything else.
-pub(crate) fn colour_of(medium: Medium) -> Color {
-    let palette = crownuikit::config::theme();
+/// The scale every trace is drawn against, so two lanes can be compared by eye.
+pub(crate) fn ceiling(lanes: &[LaneView]) -> f64 {
+    lanes
+        .iter()
+        .flat_map(|lane| lane.history.iter().copied())
+        .fold(1.0_f64, f64::max)
+}
+
+pub(crate) fn fraction(progress: Option<Progress>) -> f32 {
+    progress
+        .filter(|progress| progress.total_bytes > 0)
+        .map_or(0.0, |progress| {
+            (progress.delivered_bytes as f64 / progress.total_bytes as f64) as f32
+        })
+}
+
+/// A stable colour per medium, taken from the palette so that it follows the theme.
+pub(crate) fn colour_of(medium: Medium, theme: &Theme) -> Color {
     match medium {
-        Medium::WifiInfra | Medium::WifiDirect => palette.accent.start,
-        Medium::UsbAccessory => palette.status.success,
-        Medium::BluetoothClassic | Medium::BluetoothLe => palette.status.warning,
-        Medium::Loopback => palette.text.muted,
+        Medium::WifiInfra | Medium::WifiDirect => theme.accent.start,
+        Medium::UsbAccessory => theme.status.success,
+        Medium::BluetoothClassic | Medium::BluetoothLe => theme.status.warning,
+        Medium::Loopback => theme.text.muted,
     }
 }
