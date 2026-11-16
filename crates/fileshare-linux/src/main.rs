@@ -9,6 +9,7 @@ mod report;
 mod selftest;
 mod session;
 mod ui;
+mod utils;
 
 use std::path::{Path, PathBuf};
 

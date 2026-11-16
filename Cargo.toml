@@ -36,5 +36,3 @@ lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 
-[patch.crates-io]
-vello_encoding = { path = "../vendor/vello_encoding-0.6.0" }

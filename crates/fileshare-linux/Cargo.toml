@@ -13,11 +13,17 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
-crownuikit = { path = "../../../crownuikit" }
-xilem = "0.4.0"
-winit = "0.30.13"
-blinc_icons = "0.5.1"
+crownui = { path = "../../../crownui/crownui", default-features = false, features = [
+  "wayland",
+  "impeller",
+  "static",
+  "tokio",
+  "accessibility",
+] }
 rfd = "0.16.0"
+
+[dev-dependencies]
+crowntest = { path = "../../../crownui/crowntest" }
 
 [lints]
 workspace = true

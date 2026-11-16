@@ -1,49 +1,64 @@
 use std::path::PathBuf;
 
+use crownui::prelude::Cx;
 use ffsp_protocol::engine::{Diagnostic, EngineEvent};
 use ffsp_protocol::medium::Medium;
-use xilem::ViewCtx;
-use xilem::core::{MessageProxy, NoElement, View};
-use xilem::tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use xilem::view::worker_raw;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::session::{Rig, RigOptions};
-use crate::ui::state::{AppState, RigCommand, RigEvent};
+use crate::ui::state::{RigCommand, RigEvent, Store};
 
-/// Bridges the engine to the window.
+/// The maximum number of events that one UI wake-up applies.
+const EVENT_BURST: usize = 64;
+
+type EventSender = UnboundedSender<RigEvent>;
+
+/// Starts the rig on `rig_runtime` and connects it to `store`.
 ///
-/// Mounted at the root rather than inside a page, so navigating between pages does not restart
-/// the rig. Samples are batched into one message per tick: every message sent through the proxy
-/// costs a full rebuild of the view tree, so one per medium per tick would multiply that by the
-/// number of mediums for no extra information.
-pub(crate) fn rig_worker() -> impl View<AppState, (), ViewCtx, Element = NoElement> + Send + Sync {
-    worker_raw(
-        |proxy: MessageProxy<RigEvent>, commands: UnboundedReceiver<RigCommand>| {
-            drive(proxy, commands)
-        },
-        |state: &mut AppState, sender: UnboundedSender<RigCommand>| state.attach(sender),
-        |state: &mut AppState, event: RigEvent| state.apply(event),
-    )
+/// The root view calls this function, not a page. Thus navigation does not restart the rig.
+pub(crate) fn connect_rig(cx: &mut Cx, store: Store, rig_runtime: &Handle) {
+    let (commands, command_receiver) = unbounded_channel();
+    let (events, event_receiver) = unbounded_channel();
+    rig_runtime.spawn(drive(events, command_receiver));
+    store.attach(cx, commands);
+    apply_events(cx, store, event_receiver);
 }
 
-async fn drive(proxy: MessageProxy<RigEvent>, mut commands: UnboundedReceiver<RigCommand>) {
-    let _ = proxy.message(RigEvent::Readiness(readiness().await));
+fn apply_events(cx: &mut Cx, store: Store, mut events: UnboundedReceiver<RigEvent>) {
+    let next_burst = async move {
+        let mut burst = Vec::with_capacity(EVENT_BURST);
+        let open = events.recv_many(&mut burst, EVENT_BURST).await > 0;
+        (events, burst, open)
+    };
+    cx.spawn(next_burst, move |cx, (events, burst, open)| {
+        for event in burst {
+            store.apply(cx, event);
+        }
+        if open {
+            apply_events(cx, store, events);
+        }
+    });
+}
+
+async fn drive(to_window: EventSender, mut commands: UnboundedReceiver<RigCommand>) {
+    let _ = to_window.send(RigEvent::Readiness(readiness().await));
 
     while let Some(command) = commands.recv().await {
         let outcome = match command {
-            RigCommand::Receive => receive(&proxy).await,
-            RigCommand::Send(path) => send(&proxy, path).await,
-            RigCommand::SelfTest => self_test(&proxy).await,
+            RigCommand::Receive => receive(&to_window).await,
+            RigCommand::Send(path) => send(&to_window, path).await,
+            RigCommand::SelfTest => self_test(&to_window).await,
         };
         if let Err(reason) = outcome {
-            let _ = proxy.message(RigEvent::Failed(format!("{reason:#}")));
+            let _ = to_window.send(RigEvent::Failed(format!("{reason:#}")));
         }
-        let _ = proxy.message(RigEvent::Readiness(readiness().await));
+        let _ = to_window.send(RigEvent::Readiness(readiness().await));
     }
 }
 
-async fn receive(proxy: &MessageProxy<RigEvent>) -> anyhow::Result<()> {
-    let _ = proxy.message(RigEvent::Status(
+async fn receive(to_window: &EventSender) -> anyhow::Result<()> {
+    let _ = to_window.send(RigEvent::Status(
         "Bringing up Bluetooth, then Wi-Fi and USB over it…".to_owned(),
     ));
     let mut rig = Rig::start(RigOptions {
@@ -51,12 +66,12 @@ async fn receive(proxy: &MessageProxy<RigEvent>) -> anyhow::Result<()> {
         ..RigOptions::default()
     })?;
     rig.bring_up().await?;
-    let _ = proxy.message(RigEvent::Status("Waiting for an offer…".to_owned()));
-    pump(proxy, rig, None).await
+    let _ = to_window.send(RigEvent::Status("Waiting for an offer…".to_owned()));
+    pump(to_window, rig, None).await
 }
 
-async fn send(proxy: &MessageProxy<RigEvent>, path: PathBuf) -> anyhow::Result<()> {
-    let _ = proxy.message(RigEvent::Status(format!(
+async fn send(to_window: &EventSender, path: PathBuf) -> anyhow::Result<()> {
+    let _ = to_window.send(RigEvent::Status(format!(
         "Bringing up mediums to send {}…",
         path.display()
     )));
@@ -65,24 +80,24 @@ async fn send(proxy: &MessageProxy<RigEvent>, path: PathBuf) -> anyhow::Result<(
         ..RigOptions::default()
     })?;
     let peer = rig.bring_up().await?;
-    let _ = proxy.message(RigEvent::Status("Offering…".to_owned()));
-    pump(proxy, rig, Some((peer, path))).await
+    let _ = to_window.send(RigEvent::Status("Offering…".to_owned()));
+    pump(to_window, rig, Some((peer, path))).await
 }
 
-async fn self_test(proxy: &MessageProxy<RigEvent>) -> anyhow::Result<()> {
-    let _ = proxy.message(RigEvent::Status(
+async fn self_test(to_window: &EventSender) -> anyhow::Result<()> {
+    let _ = to_window.send(RigEvent::Status(
         "Running the stack against itself — no radio involved.".to_owned(),
     ));
     let scratch = std::env::temp_dir().join(format!("ffsp-selftest-{}", std::process::id()));
     let report = crate::selftest::run(3, 64 * 1024 * 1024, scratch.clone()).await?;
     let _ = std::fs::remove_dir_all(&scratch);
-    let _ = proxy.message(RigEvent::Finished(Box::new(report)));
+    let _ = to_window.send(RigEvent::Finished(Box::new(report)));
     Ok(())
 }
 
 /// Drives one transfer, forwarding progress as it happens.
 async fn pump(
-    proxy: &MessageProxy<RigEvent>,
+    to_window: &EventSender,
     rig: Rig,
     offer: Option<(ffsp_protocol::device::DeviceId, PathBuf)>,
 ) -> anyhow::Result<()> {
@@ -99,7 +114,7 @@ async fn pump(
                 manifest,
             } => {
                 let bytes: u64 = manifest.entries().iter().map(|entry| entry.len()).sum();
-                let _ = proxy.message(RigEvent::Status(format!(
+                let _ = to_window.send(RigEvent::Status(format!(
                     "Receiving {} MiB",
                     bytes / (1024 * 1024)
                 )));
@@ -111,9 +126,9 @@ async fn pump(
             EngineEvent::TransferProgress {
                 progress, lanes, ..
             } => {
-                let _ = proxy.message(RigEvent::Progress(progress));
+                let _ = to_window.send(RigEvent::Progress(progress));
                 for lane in lanes {
-                    let _ = proxy.message(RigEvent::Lane {
+                    let _ = to_window.send(RigEvent::Lane {
                         lane: lane.lane,
                         medium: lane.medium,
                         kbps: lane.bandwidth_kbps,
@@ -122,15 +137,15 @@ async fn pump(
                 }
             }
             EngineEvent::LaneOpened { medium, .. } => {
-                let _ = proxy.message(RigEvent::Status(format!("{medium} joined the session")));
+                let _ = to_window.send(RigEvent::Status(format!("{medium} joined the session")));
             }
             EngineEvent::TransferReport { report, .. } => {
-                let _ = proxy.message(RigEvent::Finished(report));
+                let _ = to_window.send(RigEvent::Finished(report));
                 return Ok(());
             }
             EngineEvent::Diagnostic(Diagnostic::EngineFailed { reason })
             | EngineEvent::Diagnostic(Diagnostic::LaneFailed { reason, .. }) => {
-                let _ = proxy.message(RigEvent::Status(reason));
+                let _ = to_window.send(RigEvent::Status(reason));
             }
             _ => {}
         }
