@@ -160,6 +160,18 @@ impl Rig {
             }
             _ => describe(medium),
         };
+        // Claimed before the invite: claiming flushes the pipe, and once invited the phone's
+        // first frame would be flushed along with the leftovers.
+        let mut usb = match medium {
+            Medium::UsbAccessory => Some(
+                tokio::time::timeout(MEDIUM_TIMEOUT, UsbMedium::new(&self.options.name).open())
+                    .await
+                    .with_context(|| {
+                        format!("{medium} did not come up within {MEDIUM_TIMEOUT:?}")
+                    })??,
+            ),
+            _ => None,
+        };
 
         self.engine.send(EngineCommand::InviteLane {
             peer,
@@ -175,7 +187,9 @@ impl Rig {
                     let (channel, _) = listener.accept().await?;
                     Ok::<_, anyhow::Error>(channel)
                 }
-                Medium::UsbAccessory => Ok(UsbMedium::new(&self.options.name).open().await?),
+                Medium::UsbAccessory => usb
+                    .take()
+                    .ok_or_else(|| anyhow!("the USB lane was not claimed before its invite")),
                 Medium::BluetoothClassic => {
                     let mut bluetooth = BluetoothMedium::open(DISCOVERABLE_FOR).await?;
                     let (channel, _) = bluetooth.accept().await?;
@@ -263,7 +277,8 @@ impl Rig {
                 EngineEvent::Diagnostic(Diagnostic::EngineFailed { reason }) => {
                     bail!("the transfer failed: {reason}")
                 }
-                _ => {}
+                EngineEvent::TransferProgress { .. } => {}
+                other => tracing::debug!(event = ?other, "engine event"),
             }
         }
     }

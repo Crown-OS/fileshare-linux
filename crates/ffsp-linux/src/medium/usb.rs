@@ -4,8 +4,8 @@ use ffsp_protocol::medium::{
     FramedReceiver, FramedSender, LaneChannel, LaneProfile, RFCOMM_MAX_TRANSFER,
 };
 use ffsp_protocol::wire::LaneId;
-use nusb::transfer::{Bulk, In, Out};
-use nusb::{DeviceInfo, MaybeFuture};
+use nusb::transfer::{Buffer, Bulk, In, Out};
+use nusb::{DeviceInfo, Endpoint, MaybeFuture};
 
 use crate::error::{LinuxError, Result};
 use crate::medium::aoa;
@@ -14,6 +14,9 @@ use crate::medium::named::Named;
 /// How long to wait for a device to come back after being told to become an accessory.
 const REENUMERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const REENUMERATION_POLL: Duration = Duration::from_millis(100);
+/// Silence on the in endpoint that means nothing from an earlier session is still queued.
+const STALE_QUIET: Duration = Duration::from_millis(50);
+const STALE_TRANSFER_LEN: usize = 16 * 1024;
 
 /// Brings up the USB lane, including putting the phone into accessory mode.
 ///
@@ -42,7 +45,7 @@ impl UsbMedium {
     /// Opens a lane, switching the phone into accessory mode first if it is not already.
     pub async fn open(&self) -> Result<LaneChannel> {
         if let Some(info) = find_accessory()? {
-            return self.claim(&info);
+            return self.claim(&info).await;
         }
 
         let candidates = aoa::attached()?;
@@ -55,12 +58,14 @@ impl UsbMedium {
             }
             aoa::switch_to_accessory(&device, &self.serial).await?;
             drop(device);
-            return self.claim(&await_accessory().await?);
+            return self.claim(&await_accessory().await?).await;
         }
         Err(LinuxError::NoAndroidDevice)
     }
 
-    fn claim(&self, info: &DeviceInfo) -> Result<LaneChannel> {
+    /// Claims the accessory interface. Call it before inviting the phone onto USB: it discards
+    /// whatever is queued on the in endpoint, which by then can only be left over.
+    async fn claim(&self, info: &DeviceInfo) -> Result<LaneChannel> {
         let device = info.open().wait().map_err(|error| {
             if matches!(error.kind(), nusb::ErrorKind::PermissionDenied) {
                 LinuxError::AccessoryPermissionDenied {
@@ -76,9 +81,15 @@ impl UsbMedium {
         let write = interface
             .endpoint::<Bulk, Out>(bulk_address(&interface, false)?)?
             .writer(RFCOMM_MAX_TRANSFER);
-        let read = interface
-            .endpoint::<Bulk, In>(bulk_address(&interface, true)?)?
-            .reader(RFCOMM_MAX_TRANSFER);
+        let mut inbound = interface.endpoint::<Bulk, In>(bulk_address(&interface, true)?)?;
+        let discarded = discard_stale(&mut inbound).await;
+        if discarded > 0 {
+            tracing::info!(
+                bytes = discarded,
+                "discarded a previous session's USB frames"
+            );
+        }
+        let read = inbound.reader(RFCOMM_MAX_TRANSFER);
 
         let profile = LaneProfile::USB_ACCESSORY;
         Ok(LaneChannel::new(
@@ -93,6 +104,23 @@ impl UsbMedium {
                 Named::new("usb accessory in", read),
             )),
         ))
+    }
+}
+
+/// The phone keeps writing into the accessory after a host process dies, and the first such frame
+/// a new session read would fail its sequence check and end the lane.
+async fn discard_stale(endpoint: &mut Endpoint<Bulk, In>) -> usize {
+    let mut discarded = 0;
+    loop {
+        endpoint.submit(Buffer::new(STALE_TRANSFER_LEN));
+        match tokio::time::timeout(STALE_QUIET, endpoint.next_complete()).await {
+            Ok(completion) if completion.status.is_ok() => discarded += completion.buffer.len(),
+            Ok(_) => return discarded,
+            Err(_) => {
+                endpoint.cancel_all();
+                return discarded + endpoint.next_complete().await.buffer.len();
+            }
+        }
     }
 }
 
